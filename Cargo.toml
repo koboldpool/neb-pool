@@ -1,0 +1,37 @@
+[package]
+name = "neb-pool"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A NEB mining pool (spec/pool.md, protocol neb-pool/1) built on the node's own crates"
+repository = "https://github.com/koboldpool/neb-pool"
+
+# The NEB node's crates, straight from the official repository at a release tag.
+[dependencies]
+neb-block = { git = "https://github.com/SilasEigen/neb", tag = "v1.0.4" }
+neb-pow = { git = "https://github.com/SilasEigen/neb", tag = "v1.0.4" }
+neb-chain = { git = "https://github.com/SilasEigen/neb", tag = "v1.0.4" }
+neb-work = { git = "https://github.com/SilasEigen/neb", tag = "v1.0.4" }
+neb-node = { git = "https://github.com/SilasEigen/neb", tag = "v1.0.4" }
+neb-wallet = { git = "https://github.com/SilasEigen/neb", tag = "v1.0.4" }
+blake3 = "1"
+serde_json = "1"
+
+[[bin]]
+name = "neb-pool"
+path = "src/main.rs"
+
+[[bin]]
+name = "neb-pool-testminer"
+path = "src/testminer.rs"
+
+[[bin]]
+name = "neb-pool-txids"
+path = "src/txids.rs"
+
+[[bin]]
+name = "kobold-neb-proxy"
+path = "src/proxy.rs"
+
+[profile.release]
+debug = false
