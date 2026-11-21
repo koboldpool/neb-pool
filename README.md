@@ -44,6 +44,10 @@ cargo build --release --locked
 
 The binaries are in `target/release/`. Tested with Rust 1.96 on Debian 12 (`docker run rust:1.96-bookworm`).
 
+GitHub Actions (`.github/workflows/build.yml`) builds and tests every push on GitHub's servers. Each release (tag `v*`)
+carries the Linux binaries built that way, with `SHA256SUMS` and a link to the build log, so you can check that a
+download was built from this source.
+
 ## Run
 
 1. Run a NEB node (official release) with `--miner-lock` set to your pool wallet's lock

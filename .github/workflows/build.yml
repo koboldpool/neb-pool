@@ -1,0 +1,57 @@
+# Builds and tests neb-pool on every push; a tag v* also publishes the binaries as a GitHub release.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: rust:1.96-bookworm   # Debian 12: the binaries need glibc 2.36 or later
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release --locked
+      - name: Payout tests
+        run: |
+          command -v python3 >/dev/null || (apt-get update -qq && apt-get install -y -qq python3 >/dev/null)
+          python3 -m unittest -v test_payout
+      - name: Package
+        run: |
+          mkdir -p dist/neb-pool
+          cp target/release/neb-pool target/release/neb-pool-txids target/release/kobold-neb-proxy \
+             target/release/neb-pool-testminer payout.py README.md LICENSE NOTICE dist/neb-pool/
+          tar -C dist --owner=0 --group=0 -czf neb-pool-linux-x86_64.tar.gz neb-pool
+          sha256sum neb-pool-linux-x86_64.tar.gz > SHA256SUMS
+          sha256sum dist/neb-pool/neb-pool dist/neb-pool/neb-pool-txids dist/neb-pool/kobold-neb-proxy
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neb-pool-linux-x86_64
+          path: |
+            neb-pool-linux-x86_64.tar.gz
+            SHA256SUMS
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: neb-pool-linux-x86_64
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" neb-pool-linux-x86_64.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "neb-pool $GITHUB_REF_NAME" \
+            --notes "Built by GitHub Actions from commit $GITHUB_SHA (build log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Check the download with: sha256sum -c SHA256SUMS"
