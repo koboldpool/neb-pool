@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-24.04
     container: rust:1.96-bookworm   # Debian 12: the binaries need glibc 2.36 or later
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build
         run: cargo build --release --locked
       - name: Payout tests
@@ -31,7 +31,7 @@ jobs:
           sha256sum neb-pool-linux-x86_64.tar.gz > SHA256SUMS
           sha256sum dist/neb-pool/neb-pool dist/neb-pool/neb-pool-txids dist/neb-pool/kobold-neb-proxy
           cat SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: neb-pool-linux-x86_64
           path: |
@@ -45,7 +45,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: neb-pool-linux-x86_64
       - name: Publish the release
