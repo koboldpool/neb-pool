@@ -16,6 +16,7 @@ neb-node = { git = "https://github.com/SilasEigen/neb", tag = "v1.0.4" }
 neb-wallet = { git = "https://github.com/SilasEigen/neb", tag = "v1.0.4" }
 blake3 = "1"
 serde_json = "1"
+ed25519-dalek = "2"
 
 [[bin]]
 name = "neb-pool"

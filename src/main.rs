@@ -11,6 +11,7 @@ use neb_node::p2p;
 use neb_node::params::Network;
 use neb_pow::shares::{Model, ShareBuffers, SharedDataset};
 use neb_work::frames::{self, FrameOut, Hello, Job, MSG_JOB, MSG_MODEL, MSG_RESULT, ResultMsg, Submit};
+use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -18,7 +19,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,39 @@ struct Config {
     data: PathBuf,
     start_k: u32,
     name: String,
+    /// 32-byte Ed25519 seed: with it, every job to a miner that sent a lock challenge is signed (pool lock).
+    lock_key: PathBuf,
+}
+
+/// The pool lock key (--lock-key), set once at start.
+static LOCK_KEY: OnceLock<SigningKey> = OnceLock::new();
+
+fn lock_key(path: &std::path::Path) -> Result<SigningKey, String> {
+    let b = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let seed: [u8; 32] = b.as_slice().try_into().map_err(|_| format!("{}: not 32 bytes", path.display()))?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+/// What the pool signs for a locked miner: the miner's challenge and every job field that fixes the header.
+fn lock_message(challenge: &[u8; 32], job_id: &str, n: &Job, weights_hash: &[u8; 32]) -> Vec<u8> {
+    let mut m = b"kobold-pool-lock/1/neb".to_vec();
+    m.extend_from_slice(challenge);
+    for v in [n.version, n.time_start, n.time_window, n.bits, n.tx_count] {
+        m.extend_from_slice(&v.to_le_bytes());
+    }
+    m.extend_from_slice(&n.parent);
+    for b in [&n.coinbase_prefix, &n.coinbase_suffix] {
+        m.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        m.extend_from_slice(b);
+    }
+    m.extend_from_slice(&(n.branch.len() as u32).to_le_bytes());
+    for b in &n.branch {
+        m.extend_from_slice(b);
+    }
+    m.extend_from_slice(&n.shares_root);
+    m.extend_from_slice(weights_hash);
+    m.extend_from_slice(job_id.as_bytes());
+    m
 }
 
 fn config() -> Config {
@@ -57,6 +91,7 @@ fn config() -> Config {
         dataset: "neb-datasets.bin".into(),
         data: "pool-data".into(),
         start_k: 10,
+        lock_key: PathBuf::new(),
         name: "neb-pool".into(),
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -79,10 +114,16 @@ fn config() -> Config {
             "--data" => c.data = v.into(),
             "--start-k" => c.start_k = v.parse().expect("--start-k N"),
             "--name" => c.name = v,
+            "--lock-key" => c.lock_key = v.into(),
+            "--lock-pubkey" => {
+                let key = lock_key(std::path::Path::new(&v)).expect("--lock-pubkey <key file>");
+                println!("{}", hex(key.verifying_key().as_bytes()));
+                std::process::exit(0);
+            }
             "--help" | "-h" => {
                 println!(
                     "neb-pool [--network mainnet|testnet] [--listen 0.0.0.0:3460] [--listen-solo 0.0.0.0:3470] [--node-work 127.0.0.1:3441] [--node-p2p 127.0.0.1:3440] \
-                     [--dataset neb-datasets.bin] [--data pool-data] [--start-k 10] [--name neb-pool]"
+                     [--dataset neb-datasets.bin] [--data pool-data] [--start-k 10] [--name neb-pool] [--lock-key <file>]"
                 );
                 std::process::exit(0);
             }
@@ -210,6 +251,8 @@ struct SessState {
     window_count: usize,
     second: (Instant, usize),
     bad_in_a_row: u32,
+    /// The miner's lock challenge from mining.subscribe: its jobs carry the pool's signature over it.
+    lock: Option<[u8; 32]>,
 }
 
 struct Session {
@@ -243,7 +286,7 @@ fn shifted(base: &[u8; 32], k: u32) -> [u8; 32] {
 
 /// Sends what a session needs before a job: its target, the model if new, then the job.
 fn push_job(sess: &Session, job: &PoolJob, clean: bool) {
-    let (target, need_model) = {
+    let (target, need_model, lock) = {
         let mut st = sess.st.lock().unwrap();
         if st.logins.is_empty() {
             return;
@@ -260,7 +303,7 @@ fn push_job(sess: &Session, job: &PoolJob, clean: bool) {
                 st.sent_models.pop_front();
             }
         }
-        (target, need_model)
+        (target, need_model, st.lock)
     };
     if let Some(t) = target {
         sess.notify("mining.set_target", json!([hex(&t)]));
@@ -269,9 +312,7 @@ fn push_job(sess: &Session, job: &PoolJob, clean: bool) {
         sess.notify("mining.set_model", json!([job.slot, hex(&job.weights_hash), job.weights_hex.as_str()]));
     }
     let n = &job.node;
-    sess.notify(
-        "mining.notify",
-        json!([{
+    let mut msg = json!([{
             "job_id": job.id, "clean": clean, "version": n.version, "parent": hex(&n.parent),
             "time_start": n.time_start, "time_window": n.time_window, "bits": n.bits,
             "target": hex(&n.target), "share_target": hex(&n.share_target),
@@ -279,8 +320,11 @@ fn push_job(sess: &Session, job: &PoolJob, clean: bool) {
             "branch": n.branch.iter().map(|b| hex(b)).collect::<Vec<_>>(), "tx_count": n.tx_count,
             "shares_root": hex(&n.shares_root), "height": n.height, "slot": job.slot,
             "weights_hash": hex(&job.weights_hash), "expiry": n.expiry
-        }]),
-    );
+        }]);
+    if let (Some(key), Some(ch)) = (LOCK_KEY.get(), lock) {
+        msg[0]["sig"] = json!(hex(&key.sign(&lock_message(&ch, &job.id.to_string(), n, &job.weights_hash)).to_bytes()));
+    }
+    sess.notify("mining.notify", msg);
 }
 
 // ------------------------------------------------------------------------------------- node link
@@ -571,6 +615,7 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
             window_count: 0,
             second: (Instant::now(), 0),
             bad_in_a_row: 0,
+            lock: None,
         }),
     });
     sh.sessions.lock().unwrap().push(sess.clone());
@@ -592,7 +637,7 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
         let p = req.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let reply = match method {
-            "mining.subscribe" => subscribe(&sh, &sess, &rid),
+            "mining.subscribe" => subscribe(&sh, &sess, &rid, &p),
             "mining.authorize" => authorize(&sh, &sess, &rid, &p),
             "mining.submit" => submit(&sh, &sess, &rid, &p, &mut buffers),
             // Sent by some miners (nebx-miner --suggest-diff); vardiff sets the target, so it's accepted and ignored.
@@ -618,10 +663,11 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
     sh.log(&format!("session {} {} closed ({})", sess.id, sess.peer, logins));
 }
 
-fn subscribe(sh: &Shared, sess: &Session, rid: &Value) -> Value {
+fn subscribe(sh: &Shared, sess: &Session, rid: &Value, p: &[Value]) -> Value {
     let Some(job) = sh.latest_job() else { return err(rid, 20, "pool has no work from its node yet") };
     let mut st = sess.st.lock().unwrap();
     st.subscribed = true;
+    st.lock = p.get(2).and_then(|o| o.get("lock")).and_then(|v| v.as_str()).and_then(unhex32);
     st.en2_size = job.node.extranonce_size as usize - 4;
     ok(
         rid,
@@ -891,6 +937,9 @@ fn main() {
     let open = |n: &str| OpenOptions::new().create(true).append(true).open(cfg.data.join(n)).expect("open log file");
     let files = (open("shares.jsonl"), open("blocks.jsonl"), open("pool.log"));
     let (tx, rx) = mpsc::channel();
+    if !cfg.lock_key.as_os_str().is_empty() {
+        let _ = LOCK_KEY.set(lock_key(&cfg.lock_key).expect("--lock-key"));
+    }
     let sh = Arc::new(Shared {
         datasets,
         dataset_hash,
