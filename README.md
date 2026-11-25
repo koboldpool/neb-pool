@@ -11,6 +11,7 @@ tag (see `Cargo.toml`; `Cargo.lock` pins the exact commit).
 |---|---|
 | `neb-pool` | the pool server: stratum for miners (PPLNS port and solo port), jobs from the node, every share checked with the node's own code |
 | `payout.py` | PPLNS payouts: credits mature pool blocks, pays balances with `neb-wallet`, tracks every payment until it is deep in the chain |
+| `kobold_ledger.py` | crash-safe ledger for `payout.py` (keep it next to it): a lock, durable saves, dated copies, and each payment saved before it is sent, so a crash can't pay twice |
 | `neb-pool-txids` | helper for `payout.py`: the transaction ids of blocks, decoded with the node's code |
 | `kobold-neb-proxy` | lets NEB's official, unmodified `neb-miner-gpu` / `neb-miner-cpu` mine on any `neb-pool/1` pool |
 | `neb-pool-testminer` | a small CPU miner for testing a pool end to end |
