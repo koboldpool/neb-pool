@@ -191,7 +191,7 @@ struct Shared {
     /// Pool-share work since the pool's last block: effort = round work / block work.
     round_work: Mutex<f64>,
     counters: Counters,
-    files: Mutex<(File, File, File)>, // shares.jsonl, blocks.jsonl, pool.log
+    files: Mutex<(File, File, File, File)>, // shares.jsonl, blocks.jsonl, pool.log, rejects.jsonl
     started: u64,
 }
 
@@ -206,7 +206,11 @@ impl Shared {
 
     fn record(&self, which: usize, v: Value) {
         if let Ok(mut f) = self.files.lock() {
-            let file = if which == 0 { &mut f.0 } else { &mut f.1 };
+            let file = match which {
+                0 => &mut f.0,
+                1 => &mut f.1,
+                _ => &mut f.3, // REJECTS
+            };
             let _ = writeln!(file, "{v}");
         }
     }
@@ -567,6 +571,19 @@ fn p2p_reader(sh: Arc<Shared>, mut stream: TcpStream, out: Arc<Mutex<TcpStream>>
 
 // ------------------------------------------------------------------------------------- miners
 
+/// Which file `Shared::record` writes to: one line per refused share, for our monitoring only (the site never reads it).
+const REJECTS: usize = 2;
+
+/// A refused submit (any error answer) as one line in rejects.jsonl.
+fn log_reject(sh: &Shared, sess: &Session, p: &[Value], reply: &Value) {
+    let Some(e) = reply.get("error").filter(|e| !e.is_null()) else { return };
+    let who = p.first().and_then(|v| v.as_str()).unwrap_or("");
+    let (addr, worker) = who.split_once('.').unwrap_or((who, ""));
+    let reason = e.get(1).and_then(|v| v.as_str()).unwrap_or("");
+    sh.record(REJECTS, json!({"ts": now(), "addr": addr, "worker": worker, "ip": sess.peer,
+        "reason": reason, "stale": reason.contains("stale")}));
+}
+
 fn err(id: &Value, code: u32, msg: &str) -> Value {
     json!({"id": id, "result": null, "error": [code, msg]})
 }
@@ -639,7 +656,11 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
         let reply = match method {
             "mining.subscribe" => subscribe(&sh, &sess, &rid, &p),
             "mining.authorize" => authorize(&sh, &sess, &rid, &p),
-            "mining.submit" => submit(&sh, &sess, &rid, &p, &mut buffers),
+            "mining.submit" => {
+                let r = submit(&sh, &sess, &rid, &p, &mut buffers);
+                log_reject(&sh, &sess, &p, &r);
+                r
+            }
             // Sent by some miners (nebx-miner --suggest-diff); vardiff sets the target, so it's accepted and ignored.
             "mining.suggest_difficulty" | "mining.suggest_target" | "mining.extranonce.subscribe" => ok(&rid, json!(true)),
             _ => err(&rid, 20, "unknown method"),
@@ -950,7 +971,7 @@ fn main() {
         cfg.node_p2p = format!("127.0.0.1:{}", np.p2p_port);
     }
     let open = |n: &str| OpenOptions::new().create(true).append(true).open(cfg.data.join(n)).expect("open log file");
-    let files = (open("shares.jsonl"), open("blocks.jsonl"), open("pool.log"));
+    let files = (open("shares.jsonl"), open("blocks.jsonl"), open("pool.log"), open("rejects.jsonl"));
     let (tx, rx) = mpsc::channel();
     if !cfg.lock_key.as_os_str().is_empty() {
         let _ = LOCK_KEY.set(lock_key(&cfg.lock_key).expect("--lock-key"));
