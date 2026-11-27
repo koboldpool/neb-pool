@@ -1,10 +1,14 @@
 //! neb-pool: a NEB mining pool server (spec/pool.md, protocol neb-pool/1). Takes jobs from its node's work service,
 //! checks every share with the node's own code (neb-pow) and sends blocks and chain shares back to the node.
 //! Accepted shares go to <data>/shares.jsonl, blocks to blocks.jsonl, stats.json every 10 s; payouts are payout.py.
+//! Besides neb-pool/1, every port also speaks the Suprnova-style stratum and the NEB work protocol (see dialects.rs),
+//! so the common third-party miners work without options.
 
 mod common;
+mod dialects;
 
 use common::*;
+use dialects::Proto;
 use neb_block::Target;
 use neb_chain::ShareRecord;
 use neb_node::p2p;
@@ -141,9 +145,23 @@ struct PoolJob {
     slot: u8,
     model: Arc<Model>,
     weights_hash: [u8; 32],
-    weights_hex: Arc<String>,
+    weights: Arc<Weights>,
     clean: bool,
     created: Instant,
+}
+
+/// The packed weights of a job's model, in the encodings the dialects send: hex (neb-pool/1), base64 (Suprnova-style
+/// stratum), raw bytes (Model frame of the work protocol).
+struct Weights {
+    raw: Vec<u8>,
+    hex: String,
+    b64: String,
+}
+
+impl Weights {
+    fn new(raw: &[u8]) -> Weights {
+        Weights { raw: raw.to_vec(), hex: hex(raw), b64: dialects::base64(raw) }
+    }
 }
 
 struct BlockCand {
@@ -257,6 +275,13 @@ struct SessState {
     bad_in_a_row: u32,
     /// The miner's lock challenge from mining.subscribe: its jobs carry the pool's signature over it.
     lock: Option<[u8; 32]>,
+    /// The dialect the miner speaks (dialects.rs); neb-pool/1 unless it said otherwise.
+    proto: Proto,
+    /// The extranonce1 the miner was given: `en1` for neb-pool/1, `en1` padded with zeros to the node's extranonce
+    /// size minus 8 for the stratum dialect (8-byte extranonce2, as on Suprnova).
+    en1x: Vec<u8>,
+    /// Jobs sent to a work-protocol miner (each has its own id and extranonce prefix).
+    work: dialects::WorkState,
 }
 
 struct Session {
@@ -289,11 +314,15 @@ fn shifted(base: &[u8; 32], k: u32) -> [u8; 32] {
 }
 
 /// Sends what a session needs before a job: its target, the model if new, then the job.
-fn push_job(sess: &Session, job: &PoolJob, clean: bool) {
-    let (target, need_model, lock) = {
+fn push_job(sess: &Session, job: &Arc<PoolJob>, clean: bool) {
+    let (target, need_model, lock, proto) = {
         let mut st = sess.st.lock().unwrap();
         if st.logins.is_empty() {
             return;
+        }
+        if st.proto == Proto::Work {
+            drop(st);
+            return dialects::push_work_job(sess, job, clean);
         }
         let target = shifted(&job.node.share_target, st.k);
         let target = if st.sent_target == Some(target) { None } else { Some(target) };
@@ -307,13 +336,23 @@ fn push_job(sess: &Session, job: &PoolJob, clean: bool) {
                 st.sent_models.pop_front();
             }
         }
-        (target, need_model, st.lock)
+        (target, need_model, st.lock, st.proto)
     };
+    if proto == Proto::Stratum {
+        if let Some(t) = target {
+            sess.notify("mining.set_difficulty", json!([dialects::difficulty(&t)]));
+        }
+        if need_model {
+            sess.notify("mining.set_model", json!([hex(&job.weights_hash), job.slot, job.weights.b64.as_str()]));
+        }
+        sess.notify("mining.notify", dialects::stratum_notify(&job.node, &job.id, job.slot, &job.weights_hash, clean));
+        return;
+    }
     if let Some(t) = target {
         sess.notify("mining.set_target", json!([hex(&t)]));
     }
     if need_model {
-        sess.notify("mining.set_model", json!([job.slot, hex(&job.weights_hash), job.weights_hex.as_str()]));
+        sess.notify("mining.set_model", json!([job.slot, hex(&job.weights_hash), job.weights.hex.as_str()]));
     }
     let n = &job.node;
     let mut msg = json!([{
@@ -361,7 +400,7 @@ fn node_loop(sh: Arc<Shared>) {
 fn read_node(sh: &Arc<Shared>, mut stream: TcpStream) {
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = vec![0u8; 65536];
-    let mut model: Option<(u8, Arc<Model>, [u8; 32], Arc<String>)> = None;
+    let mut model: Option<(u8, Arc<Model>, [u8; 32], Arc<Weights>)> = None;
     let mut last_parent: Option<[u8; 32]> = None;
     loop {
         match stream.read(&mut tmp) {
@@ -379,7 +418,7 @@ fn read_node(sh: &Arc<Shared>, mut stream: TcpStream) {
                                 if m.weights_hash() != wh {
                                     sh.log("node sent a model whose weights hash does not match; ignored");
                                 } else {
-                                    model = Some((slot, Arc::new(m), wh, Arc::new(hex(&payload[33..]))));
+                                    model = Some((slot, Arc::new(m), wh, Arc::new(Weights::new(&payload[33..]))));
                                 }
                             }
                             _ => {
@@ -419,13 +458,13 @@ fn read_node(sh: &Arc<Shared>, mut stream: TcpStream) {
     }
 }
 
-fn install_job(sh: &Arc<Shared>, node: Job, slot: u8, model: Arc<Model>, wh: [u8; 32], wx: Arc<String>, clean: bool) {
+fn install_job(sh: &Arc<Shared>, node: Job, slot: u8, model: Arc<Model>, wh: [u8; 32], wx: Arc<Weights>, clean: bool) {
     if (slot as usize) >= sh.datasets.len() || sh.datasets[slot as usize].arch() != model.arch() {
         sh.log(&format!("job on slot {slot} does not fit the dataset file; not used (wrong dataset?)"));
         return;
     }
     let id = format!("{:x}", sh.next_job.fetch_add(1, Ordering::Relaxed));
-    let job = Arc::new(PoolJob { id, node, slot, model, weights_hash: wh, weights_hex: wx, clean, created: Instant::now() });
+    let job = Arc::new(PoolJob { id, node, slot, model, weights_hash: wh, weights: wx, clean, created: Instant::now() });
     {
         let mut jobs = sh.jobs.lock().unwrap();
         jobs.push_back(job.clone());
@@ -633,9 +672,21 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
             second: (Instant::now(), 0),
             bad_in_a_row: 0,
             lock: None,
+            proto: Proto::NebPool,
+            en1x: en1.to_vec(),
+            work: dialects::WorkState::default(),
         }),
     });
     sh.sessions.lock().unwrap().push(sess.clone());
+    // A miner that opens with a binary Hello frame speaks the NEB work protocol (INVminer, Aria in "aria" mode).
+    if dialects::is_work_hello(&stream) {
+        dialects::serve_work(&sh, &sess, stream);
+        sess.alive.store(false, Ordering::Relaxed);
+        sh.sessions.lock().unwrap().retain(|s| s.id != sess.id);
+        let logins = sess.st.lock().unwrap().logins.iter().cloned().collect::<Vec<_>>().join(",");
+        sh.log(&format!("session {} {} closed ({})", sess.id, sess.peer, logins));
+        return;
+    }
     let mut reader = BufReader::new(stream);
     let mut buffers = ShareBuffers::new();
     let mut line = String::new();
@@ -688,8 +739,17 @@ fn subscribe(sh: &Shared, sess: &Session, rid: &Value, p: &[Value]) -> Value {
     let Some(job) = sh.latest_job() else { return err(rid, 20, "pool has no work from its node yet") };
     let mut st = sess.st.lock().unwrap();
     st.subscribed = true;
+    // neb-pool/1 miners name the protocol (spec/pool.md 4); a subscribe without it is the Suprnova-style stratum
+    // (suprminer sends only its agent).
+    if p.get(1).and_then(|v| v.as_str()) != Some("neb-pool/1") {
+        st.proto = Proto::Stratum;
+        let (en1x, en2) = dialects::stratum_extranonce(&st.en1, job.node.extranonce_size as usize);
+        (st.en1x, st.en2_size) = (en1x, en2);
+        return ok(rid, dialects::stratum_subscribe_result(sess.id, &st.en1x, st.en2_size));
+    }
     st.lock = p.get(2).and_then(|o| o.get("lock")).and_then(|v| v.as_str()).and_then(unhex32);
     st.en2_size = job.node.extranonce_size as usize - 4;
+    st.en1x = st.en1.to_vec();
     ok(
         rid,
         json!({"session": format!("{:x}", sess.id), "extranonce1": hex(&st.en1), "extranonce2_size": st.en2_size,
@@ -718,18 +778,49 @@ fn authorize(sh: &Shared, sess: &Session, rid: &Value, p: &[Value]) -> Value {
     } else {
         st.solo.remove(login);
     }
+    let proto = st.proto;
     drop(st);
-    sh.log(&format!("session {} {} authorized {login}{}", sess.id, sess.peer, if solo { " (solo)" } else { "" }));
+    sh.log(&format!(
+        "session {} {} authorized {login}{}{}",
+        sess.id,
+        sess.peer,
+        if solo { " (solo)" } else { "" },
+        if proto == Proto::NebPool { String::new() } else { format!(" ({})", proto.name()) }
+    ));
     ok(rid, json!(true))
+}
+
+/// Rate limit: a few submits per second at most; above it the session is closed.
+fn rate_ok(sess: &Session, st: &mut SessState) -> bool {
+    let now_i = Instant::now();
+    if now_i.duration_since(st.second.0) >= Duration::from_secs(1) {
+        st.second = (now_i, 0);
+    }
+    st.second.1 += 1;
+    if st.second.1 > MAX_SUBMITS_PER_SEC {
+        sess.alive.store(false, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// A u32 submit parameter: a JSON number (neb-pool/1) or a big-endian hex string (Suprnova-style stratum sends the
+/// time and the nonce as "6b08d23e").
+fn u32_param(v: &Value) -> Option<u32> {
+    match v {
+        Value::Number(_) => v.as_u64().and_then(|x| u32::try_from(x).ok()),
+        Value::String(s) if !s.is_empty() && s.len() <= 8 => u32::from_str_radix(s, 16).ok(),
+        _ => None,
+    }
 }
 
 fn submit(sh: &Shared, sess: &Session, rid: &Value, p: &[Value], buffers: &mut ShareBuffers) -> Value {
     let login = p.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
     let job_id = p.get(1).and_then(|v| v.as_str()).unwrap_or("");
     let en2 = p.get(2).and_then(|v| v.as_str()).and_then(unhex);
-    let time = p.get(3).and_then(|v| v.as_u64());
-    let nonce = p.get(4).and_then(|v| v.as_u64());
-    let (en1, en2_size, pool_k, solo) = {
+    let time = p.get(3).and_then(u32_param);
+    let nonce = p.get(4).and_then(u32_param);
+    let (en1x, en2_size) = {
         let mut st = sess.st.lock().unwrap();
         if !st.subscribed {
             return err(rid, 25, "not subscribed");
@@ -737,38 +828,58 @@ fn submit(sh: &Shared, sess: &Session, rid: &Value, p: &[Value], buffers: &mut S
         if !st.logins.contains(&login) {
             return err(rid, 24, "login not authorized");
         }
-        // Rate limit: a few submits per second at most.
-        let now_i = Instant::now();
-        if now_i.duration_since(st.second.0) >= Duration::from_secs(1) {
-            st.second = (now_i, 0);
-        }
-        st.second.1 += 1;
-        if st.second.1 > MAX_SUBMITS_PER_SEC {
-            sess.alive.store(false, Ordering::Relaxed);
+        if !rate_ok(sess, &mut st) {
             return err(rid, 20, "too many submits");
         }
-        // Accept the previous, easier target for 30 s after vardiff made it harder.
-        let k = if now_i.duration_since(st.k_changed) < Duration::from_secs(30) { st.k.max(st.k_prev) } else { st.k };
-        (st.en1, st.en2_size, k, st.solo.contains(&login))
+        (st.en1x.clone(), st.en2_size)
     };
     let Some(job) = sh.job(job_id).filter(|j| (now() as u32) <= j.node.expiry) else {
         return err(rid, 21, "job not found or past its expiry");
     };
-    let Some(en2) = en2.filter(|e| e.len() == en2_size && en2_size + 4 == job.node.extranonce_size as usize) else {
+    let Some(en2) = en2.filter(|e| e.len() == en2_size && en1x.len() + en2_size == job.node.extranonce_size as usize) else {
         return err(rid, 27, "extranonce2 of the wrong length");
     };
     let (Some(time), Some(nonce)) = (time, nonce) else { return err(rid, 20, "bad params") };
-    let (time, nonce) = (time as u32, nonce as u32);
-    if time < job.node.time_start || time > job.node.time_start.saturating_add(job.node.time_window) {
-        return err(rid, 26, "time outside the window of the job");
-    }
-    let mut extranonce = en1.to_vec();
+    let mut extranonce = en1x;
     extranonce.extend_from_slice(&en2);
+    match attempt(sh, sess, &login, &job, &extranonce, time, nonce, buffers, None) {
+        Ok(()) => ok(rid, json!(true)),
+        Err((code, msg)) => err(rid, code, msg),
+    }
+}
+
+/// Checks one attempt of a session in any dialect, once its job and full extranonce are known (spec/pool.md 7.4 from
+/// the time window on), and records an accepted one: share log, chain-share relay, block, vardiff.
+#[allow(clippy::too_many_arguments)]
+fn attempt(
+    sh: &Shared,
+    sess: &Session,
+    login: &str,
+    job: &Arc<PoolJob>,
+    extranonce: &[u8],
+    time: u32,
+    nonce: u32,
+    buffers: &mut ShareBuffers,
+    job_k: Option<u32>,
+) -> Result<(), (u32, &'static str)> {
+    let login = login.to_string();
+    let extranonce = extranonce.to_vec();
+    let (pool_k, solo) = {
+        let st = sess.st.lock().unwrap();
+        // Accept the previous, easier target for 30 s after vardiff made it harder.
+        let k = if st.k_changed.elapsed() < Duration::from_secs(30) { st.k.max(st.k_prev) } else { st.k };
+        // A work-protocol job carries its own share target (`job_k`): a miner may finish an older job after a newer
+        // one changed the target, so that job's target applies.
+        (job_k.map_or(k, |jk| jk.max(k)), st.solo.contains(&login))
+    };
+    if time < job.node.time_start || time > job.node.time_start.saturating_add(job.node.time_window) {
+        return Err((26, "time outside the window of the job"));
+    }
     let header = job.node.header(&extranonce, time, nonce).encode();
     {
         let mut seen = sh.seen.lock().unwrap();
         if !seen.entry(job.node.parent).or_default().insert(header) {
-            return err(rid, 22, "duplicate attempt");
+            return Err((22, "duplicate attempt"));
         }
     }
     let key = *blake3::hash(&header).as_bytes();
@@ -782,7 +893,7 @@ fn submit(sh: &Shared, sess: &Session, rid: &Value, p: &[Value], buffers: &mut S
         if st.bad_in_a_row > MAX_BAD_IN_A_ROW {
             sess.alive.store(false, Ordering::Relaxed);
         }
-        return err(rid, 23, "ticket above the pool target");
+        return Err((23, "ticket above the pool target"));
     }
     let chain_share = Target(job.node.share_target).admits(&ticket);
     let block = Target(job.node.target).admits(&ticket);
@@ -820,11 +931,11 @@ fn submit(sh: &Shared, sess: &Session, rid: &Value, p: &[Value], buffers: &mut S
                             "block_work": work_of(&job.node.target), "mode": mode, "effort": effort,
                             "fee_bp": if solo { sh.solo_fee_bp.load(Ordering::Relaxed) } else { sh.fee_bp.load(Ordering::Relaxed) }}));
     }
-    vardiff(sh, sess, &job);
-    ok(rid, json!(true))
+    vardiff(sh, sess, job);
+    Ok(())
 }
 
-fn vardiff(sh: &Shared, sess: &Session, job: &PoolJob) {
+fn vardiff(sh: &Shared, sess: &Session, job: &Arc<PoolJob>) {
     let changed = {
         let mut st = sess.st.lock().unwrap();
         st.bad_in_a_row = 0;
@@ -886,11 +997,37 @@ fn load_fees(sh: &Shared) {
     }
 }
 
+/// Recent work per address: total, per worker, any solo share, and the solo part on its own (one address can
+/// mine both ports, so its solo and PPLNS hashrate are counted apart, as in peer-pool).
+type MinerWork = std::collections::HashMap<String, (f64, std::collections::HashMap<String, f64>, bool, f64)>;
+
+fn add_share(by_addr: &mut MinerWork, addr: &str, worker: &str, work: f64, solo: bool) {
+    let e = by_addr.entry(addr.to_string()).or_default();
+    e.0 += work;
+    *e.1.entry(worker.to_string()).or_default() += work;
+    e.2 |= solo;
+    if solo {
+        e.3 += work;
+    }
+}
+
+/// stats.json "miners": "solo_hashrate" is the part of "hashrate" from solo shares.
+fn miners_json(by_addr: &MinerWork, secs: f64) -> Vec<Value> {
+    by_addr
+        .iter()
+        .map(|(a, (w, ws, solo, solo_w))| {
+            json!({"addr": a, "hashrate": w / secs, "solo": solo, "solo_hashrate": solo_w / secs,
+                   "workers": ws.iter().map(|(n, x)| json!({"name": n, "hashrate": x / secs})).collect::<Vec<_>>()})
+        })
+        .collect()
+}
+
 fn stats_loop(sh: Arc<Shared>) {
     loop {
         thread::sleep(Duration::from_secs(10));
         load_fees(&sh);
-        let mut by_addr: HashMap<String, (f64, HashMap<String, f64>, bool)> = HashMap::new();
+        dialects::refresh_work_sessions(&sh);
+        let mut by_addr = MinerWork::new();
         let total = {
             let mut recent = sh.recent.lock().unwrap();
             while recent.front().is_some_and(|r| r.0.elapsed() > HASHRATE_WINDOW) {
@@ -899,22 +1036,13 @@ fn stats_loop(sh: Arc<Shared>) {
             let mut total = 0.0;
             for (_, a, w, work, solo) in recent.iter() {
                 total += work;
-                let e = by_addr.entry(a.clone()).or_default();
-                e.0 += work;
-                *e.1.entry(w.clone()).or_default() += work;
-                e.2 |= *solo;
+                add_share(&mut by_addr, a, w, *work, *solo);
             }
             total
         };
         let secs = HASHRATE_WINDOW.as_secs_f64();
         let job = sh.latest_job();
-        let miners: Vec<Value> = by_addr
-            .iter()
-            .map(|(a, (w, ws, solo))| {
-                json!({"addr": a, "hashrate": w / secs, "solo": solo,
-                       "workers": ws.iter().map(|(n, x)| json!({"name": n, "hashrate": x / secs})).collect::<Vec<_>>()})
-            })
-            .collect();
+        let miners = miners_json(&by_addr, secs);
         let st = json!({
             "updated": now(), "started": sh.started, "name": sh.cfg.name,
             "node_online": sh.node_up.load(Ordering::Relaxed), "peer_online": sh.p2p_up.load(Ordering::Relaxed),
@@ -1041,4 +1169,55 @@ fn main() {
         thread::spawn(move || accept(addr, true, sh2));
     }
     accept(sh.cfg.listen.clone(), false, sh.clone());
+}
+
+#[cfg(test)]
+mod solo_split_tests {
+    use super::*;
+
+    fn miner<'a>(m: &'a [Value], addr: &str) -> &'a Value {
+        m.iter().find(|x| x["addr"] == addr).unwrap()
+    }
+
+    #[test]
+    fn one_address_on_both_ports_is_split() {
+        let mut by = MinerWork::new();
+        add_share(&mut by, "A", "rig1", 300.0, false);
+        add_share(&mut by, "A", "rig2", 100.0, true);
+        add_share(&mut by, "A", "rig2", 200.0, true);
+        add_share(&mut by, "B", "x", 50.0, false);
+        add_share(&mut by, "C", "y", 60.0, true);
+        let m = miners_json(&by, 10.0);
+        assert_eq!(m.len(), 3);
+        let a = miner(&m, "A");
+        assert_eq!(a["hashrate"], json!(60.0));
+        assert_eq!(a["solo_hashrate"], json!(30.0));
+        assert_eq!(a["solo"], json!(true));
+        let rigs: Vec<(String, f64)> = a["workers"].as_array().unwrap().iter()
+            .map(|w| (w["name"].as_str().unwrap().to_string(), w["hashrate"].as_f64().unwrap())).collect();
+        assert!(rigs.contains(&("rig1".into(), 30.0)) && rigs.contains(&("rig2".into(), 30.0)));
+        let b = miner(&m, "B");
+        assert_eq!((b["solo"].clone(), b["solo_hashrate"].clone()), (json!(false), json!(0.0)));
+        let c = miner(&m, "C");
+        assert_eq!((c["solo"].clone(), c["hashrate"].clone(), c["solo_hashrate"].clone()), (json!(true), json!(6.0), json!(6.0)));
+    }
+
+    /// Offline check: SPLIT_SHARES=<shares.jsonl> SPLIT_OUT=<file> cargo test --release replay_share_log -- --ignored
+    /// replays the last hashrate window of a share log through the stats code and writes the stats.json fields.
+    #[test]
+    #[ignore]
+    fn replay_share_log() {
+        let text = std::fs::read_to_string(std::env::var("SPLIT_SHARES").unwrap()).unwrap();
+        let shares: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let last = shares.iter().filter_map(|s| s["ts"].as_f64()).fold(0.0, f64::max);
+        let win = HASHRATE_WINDOW.as_secs_f64();
+        let (mut by, mut total) = (MinerWork::new(), 0.0);
+        for s in shares.iter().filter(|s| s["ts"].as_f64().is_some_and(|t| t > last - win)) {
+            let work = s["work"].as_f64().unwrap_or(0.0);
+            total += work;
+            add_share(&mut by, s["addr"].as_str().unwrap_or(""), s["worker"].as_str().unwrap_or(""), work, s["mode"] == "solo");
+        }
+        let st = json!({"window_s": win, "last_ts": last, "hashrate": total / win, "miners": miners_json(&by, win)});
+        std::fs::write(std::env::var("SPLIT_OUT").unwrap(), serde_json::to_vec_pretty(&st).unwrap()).unwrap();
+    }
 }

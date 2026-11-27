@@ -72,8 +72,19 @@ download was built from this source.
    Options: `--fee`, `--window` (PPLNS window in block works, default 2), `--min` (minimum payout), `--reserve` (NEB
    always left in the wallet for transaction fees), `--rpc` (the node's JSON-RPC, default `http://127.0.0.1:8432`).
 
-Miners connect with any `neb-pool/1` miner, login `neb1ADDRESS.worker`; a password containing `solo` on the PPLNS port
-also selects solo mode.
+Miners log in with `neb1ADDRESS.worker`; a password containing `solo` on the PPLNS port also selects solo mode.
+
+## Miners
+
+Every port speaks three dialects and picks the miner's own by itself, so no option is needed:
+
+| Dialect | How the pool recognises it | Miners |
+|---|---|---|
+| `neb-pool/1` (JSON lines) | `mining.subscribe` names `neb-pool/1` | ffgn, FreeForGem, GB Miner, nebminer, Aria Energy, koboldpool-miner |
+| Suprnova-style stratum | `mining.subscribe` without `neb-pool/1` | suprminer (also SRBMiner, untested) |
+| NEB work protocol (binary frames) | the connection opens with a Hello frame naming `neb1ADDRESS.worker` | INVminer; Aria Energy and nebminer in their `aria` mode |
+
+All three end in the same share check (`attempt` in `src/main.rs`); the dialects are in `src/dialects.rs`.
 
 ## Official miner through the proxy
 
