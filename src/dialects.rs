@@ -127,6 +127,15 @@ pub struct WorkState {
     next: u64,
     /// The miner asked for ShareAck frames ("ack" in its Hello).
     ack: bool,
+    /// The slot and weights hash of the last Model frame sent: in the work protocol a Job carries no model, the miner
+    /// evaluates it on the last Model frame (frames.rs), so a job whose model differs needs a Model frame first, even
+    /// when that model was sent before (the same Kepler weights at heights h and h+2, with a TESS model in between).
+    last_model: Option<(u8, [u8; 32])>,
+}
+
+/// True when a work-protocol job on (slot, weights_hash) needs a Model frame before it.
+fn needs_model_frame(last: Option<(u8, [u8; 32])>, slot: u8, weights_hash: &[u8; 32]) -> bool {
+    last != Some((slot, *weights_hash))
 }
 
 /// True when the first 5 bytes are a Hello frame header: length 3..=4096, type 1. A JSON line starts with '{'.
@@ -174,7 +183,7 @@ fn send_bytes(sess: &Session, b: &[u8]) {
     }
 }
 
-/// Sends a work-protocol miner a fresh job (its Model frame first when the model is new to it).
+/// Sends a work-protocol miner a fresh job (a Model frame first when the job's model is not the last one sent).
 pub fn push_work_job(sess: &Session, job: &Arc<PoolJob>, clean: bool) {
     let mut out = Vec::new();
     {
@@ -184,11 +193,8 @@ pub fn push_work_job(sess: &Session, job: &Arc<PoolJob>, clean: bool) {
         }
         let target = shifted(&job.node.share_target, st.k);
         st.sent_target = Some(target);
-        if !st.sent_models.contains(&job.weights_hash) {
-            st.sent_models.push_back(job.weights_hash);
-            if st.sent_models.len() > 8 {
-                st.sent_models.pop_front();
-            }
+        if needs_model_frame(st.work.last_model, job.slot, &job.weights_hash) {
+            st.work.last_model = Some((job.slot, job.weights_hash));
             let mut p = vec![job.slot];
             p.extend_from_slice(&job.weights_hash);
             p.extend_from_slice(&job.weights.raw);
@@ -480,6 +486,17 @@ mod tests {
         let f = j.encode();
         let back = Job::decode(&f[5..]).unwrap();
         assert_eq!(back, j);
+    }
+
+    #[test]
+    fn work_model_frame_follows_the_last_one_sent() {
+        let (kepler, tess) = ([1u8; 32], [2u8; 32]);
+        assert!(needs_model_frame(None, 0, &kepler));
+        assert!(!needs_model_frame(Some((0, kepler)), 0, &kepler)); // a refresh of the same job: no frame
+        assert!(needs_model_frame(Some((0, kepler)), 1, &tess));
+        // Back to a Kepler model the miner already had: it still evaluates on the last frame (TESS), so resend.
+        assert!(needs_model_frame(Some((1, tess)), 0, &kepler));
+        assert!(needs_model_frame(Some((1, kepler)), 0, &kepler));
     }
 
     #[test]
